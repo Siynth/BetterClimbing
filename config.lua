@@ -1,8 +1,8 @@
 -- BetterClimbing configuration
 --
 -- Restart the game after changing these settings.
--- A full restart is recommended instead of "Restart All Mods",
--- because changes are applied directly to objects already in memory.
+-- A full restart is recommended instead of "Restart All Mods" because the
+-- mod changes objects that are already in memory.
 
 return {
     ---------------------------------------------------------------------------
@@ -15,35 +15,34 @@ return {
     --     BetterClimbing makes no changes.
     --
     -- "painted"
-    --     Recommended mode.
+    --     Recommended Vanilla+ mode.
     --
-    --     Automatically repairs registered PaintedClimbable components that
-    --     use a Solid painted region and an Adamant unpainted region.
-    --
-    --     Dedicated Adamant, Weak, and other special climbable components
-    --     remain unchanged.
+    --     Repairs the game's PaintedClimbable components while leaving
+    --     dedicated Adamant, Weak, and other special climbables unchanged.
     --
     -- "open"
     --     Relaxed climbing mode.
     --
     --     Converts every surface already registered by the game as climbable
-    --     to Solid.
-    --
-    --     Ordinary scenery and objects without a climbable component remain
+    --     to Solid. Ordinary scenery without a climbable component remains
     --     non-climbable.
     --
     surface_mode = "painted",
 
     ---------------------------------------------------------------------------
-    -- AUTOMATIC PATCHING
+    -- EVENT-DRIVEN INITIALIZATION
     ---------------------------------------------------------------------------
 
-    -- How frequently the mod checks for climbing components loaded through
-    -- level streaming.
-    scan_interval_ms = 1500,
+    -- The mod does one delayed scan after startup for objects that existed
+    -- before its callbacks were registered. This is not a repeating scan.
+    initial_scan_delay_ms = 1500,
+
+    -- Newly constructed climbing objects are processed after a short delay so
+    -- Unreal can finish applying their Blueprint defaults and construction data.
+    new_object_delay_ms = 250,
 
     -- Copies the Solid region's impact, sliding, particle, and audio references
-    -- into repaired or converted regions.
+    -- into repaired or converted regions when a known Solid behaviour exists.
     copy_solid_fx_and_audio = true,
 
     ---------------------------------------------------------------------------
@@ -51,9 +50,7 @@ return {
     ---------------------------------------------------------------------------
 
     -- Applies conservative climbing responsiveness improvements in Painted
-    -- and Open modes.
-    --
-    -- Vanilla mode ignores all settings below.
+    -- and Open modes. Vanilla mode ignores all settings below.
     enable_movement_improvements = true,
 
     -- Allows climbing to start with a single climbing input.
@@ -85,8 +82,8 @@ return {
 
     -- Enables the game's existing climbing-jump flags.
     --
-    -- This is disabled by default until it has been tested throughout the
-    -- entire game. It does not create a new jump system.
+    -- Disabled by default until it has been tested throughout the game.
+    -- This does not create a new jump system.
     enable_climbing_jump = false,
 
     -- Allows jumping while only one pickaxe is attached.
@@ -99,6 +96,7 @@ return {
     -- LOGGING
     ---------------------------------------------------------------------------
 
-    -- Writes additional information to UE4SS.log.
+    -- Writes per-object details to UE4SS.log.
+    -- Leave false for normal play.
     verbose_logging = false,
 }

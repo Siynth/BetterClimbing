@@ -6,33 +6,25 @@
 --   painted  - repairs PaintedClimbable surfaces only
 --   open     - makes all registered climbable surfaces Solid
 --
--- Objects without a climbable component are never changed.
+-- The mod performs one startup scan, then relies on NotifyOnNewObject for
+-- streamed-in objects. There is no repeating FindAllOf polling loop.
 
 local MOD_NAME = "BetterClimbing"
-local VERSION = "0.2.0"
-
--------------------------------------------------------------------------------
--- GAME ENUM VALUES
--------------------------------------------------------------------------------
+local VERSION = "0.3.0-beta"
 
 -- EClimbableType
 local TYPE_ADAMANT = 0
 local TYPE_SOLID = 1
-local TYPE_WEAK = 2
-
--------------------------------------------------------------------------------
--- DEFAULT CONFIGURATION
--------------------------------------------------------------------------------
 
 local DEFAULT_CONFIG = {
     surface_mode = "painted",
 
-    scan_interval_ms = 1500,
+    initial_scan_delay_ms = 1500,
+    new_object_delay_ms = 250,
     copy_solid_fx_and_audio = true,
 
     enable_movement_improvements = true,
     start_with_one_button = true,
-
     standing_detection_distance = 22.0,
     falling_detection_distance = 55.0,
     coyote_time = 0.30,
@@ -48,13 +40,7 @@ local DEFAULT_CONFIG = {
     verbose_logging = false,
 }
 
--------------------------------------------------------------------------------
--- FEEDBACK FIELDS
--------------------------------------------------------------------------------
-
--- These fields are copied from a known Solid behaviour when a surface is
--- converted. The behaviour's owner pointer is deliberately not copied.
-
+-- The owning Climbable pointer and ConveyorVelocity are intentionally omitted.
 local FEEDBACK_FIELDS = {
     "PickaxeImpactParticles",
     "SlideRicochetParticles",
@@ -64,7 +50,6 @@ local FEEDBACK_FIELDS = {
     "PickaxeSnapsOutOfWallParticles",
     "FootPlantedParticles",
     "FootLiftedParticles",
-
     "PickaxeSwingVoiceOver",
     "PickaxeSlideAudio",
     "SlideStoppedAudio",
@@ -73,7 +58,7 @@ local FEEDBACK_FIELDS = {
 }
 
 -------------------------------------------------------------------------------
--- CONFIG LOADING
+-- Configuration
 -------------------------------------------------------------------------------
 
 local function get_mod_directory()
@@ -89,10 +74,7 @@ local function get_mod_directory()
         source = string.sub(source, 2)
     end
 
-    return string.match(
-        source,
-        "^(.*)[/\\]scripts[/\\][^/\\]+$"
-    )
+    return string.match(source, "^(.*)[/\\]scripts[/\\][^/\\]+$")
 end
 
 local function load_config()
@@ -102,17 +84,12 @@ local function load_config()
         config[key] = value
     end
 
-    local mod_directory = get_mod_directory()
-
-    if mod_directory == nil then
+    local directory = get_mod_directory()
+    if directory == nil then
         return config
     end
 
-    local config_path =
-        mod_directory .. "\\config.lua"
-
-    local ok, user_config =
-        pcall(dofile, config_path)
+    local ok, user_config = pcall(dofile, directory .. "\\config.lua")
 
     if ok and type(user_config) == "table" then
         for key, value in pairs(user_config) do
@@ -133,28 +110,14 @@ end
 
 local Config = load_config()
 
--------------------------------------------------------------------------------
--- MODE VALIDATION
--------------------------------------------------------------------------------
-
 local function normalize_mode(value)
-    local mode =
-        string.lower(tostring(value or ""))
+    local mode = string.lower(tostring(value or ""))
 
     if mode == "vanilla" then
         return "vanilla"
-    end
-
-    if mode == "painted"
-        or mode == "painted_only" then
-
+    elseif mode == "painted" or mode == "painted_only" then
         return "painted"
-    end
-
-    if mode == "open"
-        or mode == "all"
-        or mode == "all_climbable" then
-
+    elseif mode == "open" or mode == "all" or mode == "all_climbable" then
         return "open"
     end
 
@@ -167,36 +130,26 @@ local function normalize_mode(value)
     return "painted"
 end
 
-local ActiveMode =
-    normalize_mode(Config.surface_mode)
+local ActiveMode = normalize_mode(Config.surface_mode)
 
 -------------------------------------------------------------------------------
--- RUNTIME STATE
+-- Runtime state and safe helpers
 -------------------------------------------------------------------------------
 
 local processed_painted = {}
 local processed_standard = {}
 local processed_climbers = {}
+local startup_scan_running = false
 
-local scan_running = false
-
--------------------------------------------------------------------------------
--- LOGGING
--------------------------------------------------------------------------------
+-- Store the donor owner and property name rather than a long-lived struct proxy.
+local solid_donor_owner = nil
+local solid_donor_field = nil
 
 local function log(message, force)
     if force or Config.verbose_logging then
-        print(string.format(
-            "[%s] %s\n",
-            MOD_NAME,
-            message
-        ))
+        print(string.format("[%s] %s\n", MOD_NAME, message))
     end
 end
-
--------------------------------------------------------------------------------
--- SAFE OBJECT HELPERS
--------------------------------------------------------------------------------
 
 local function is_valid(object)
     if object == nil then
@@ -210,22 +163,6 @@ local function is_valid(object)
     return ok and result
 end
 
-local function get_address(object)
-    if not is_valid(object) then
-        return nil
-    end
-
-    local ok, address = pcall(function()
-        return object:GetAddress()
-    end)
-
-    if ok and type(address) == "number" then
-        return address
-    end
-
-    return nil
-end
-
 local function get_full_name(object)
     if not is_valid(object) then
         return "Invalid"
@@ -235,36 +172,24 @@ local function get_full_name(object)
         return object:GetFullName()
     end)
 
-    if ok then
-        return name
-    end
-
-    return "Unknown"
-end
-
-local function is_default_object(object)
-    return string.find(
-        get_full_name(object),
-        "Default__",
-        1,
-        true
-    ) ~= nil
+    return ok and tostring(name) or "Unknown"
 end
 
 local function object_key(object)
-    local address = get_address(object)
-
-    if address == nil then
+    if not is_valid(object) then
         return nil
     end
 
-    -- The name is included because Unreal may reuse an address after a level
-    -- unloads and another level is streamed in.
-    return string.format(
-        "%X|%s",
-        address,
-        get_full_name(object)
-    )
+    local ok, address = pcall(function()
+        return object:GetAddress()
+    end)
+
+    if not ok or type(address) ~= "number" then
+        return nil
+    end
+
+    -- Including the name protects against address reuse after level unloads.
+    return string.format("%X|%s", address, get_full_name(object))
 end
 
 local function safe_read(object, property_name)
@@ -272,18 +197,10 @@ local function safe_read(object, property_name)
         return object[property_name]
     end)
 
-    if ok then
-        return value
-    end
-
-    return nil
+    return ok and value or nil
 end
 
-local function safe_write(
-    object,
-    property_name,
-    value
-)
+local function safe_write(object, property_name, value)
     local ok, error_message = pcall(function()
         object[property_name] = value
     end)
@@ -300,112 +217,62 @@ local function safe_write(
     return ok
 end
 
--------------------------------------------------------------------------------
--- VALUE HELPERS
--------------------------------------------------------------------------------
-
-local function set_boolean(
-    object,
-    property_name,
-    desired_value
-)
-    local current =
-        safe_read(object, property_name)
-
-    if type(current) ~= "boolean" then
-        return false
+local function run_on_game_thread(callback)
+    if type(ExecuteInGameThread) == "function" then
+        ExecuteInGameThread(callback)
+    else
+        callback()
     end
-
-    if current == desired_value then
-        return true
-    end
-
-    return safe_write(
-        object,
-        property_name,
-        desired_value
-    )
 end
 
-local function set_minimum(
-    object,
-    property_name,
-    minimum
-)
-    local current =
-        safe_read(object, property_name)
+local function set_boolean(object, property_name, value)
+    local current = safe_read(object, property_name)
 
-    if type(current) ~= "number" then
-        return false
+    if type(current) ~= "boolean" or current == value then
+        return
     end
 
-    if current >= minimum then
-        return true
-    end
-
-    return safe_write(
-        object,
-        property_name,
-        minimum
-    )
+    safe_write(object, property_name, value)
 end
 
-local function set_maximum(
-    object,
-    property_name,
-    maximum
-)
-    local current =
-        safe_read(object, property_name)
+local function set_minimum(object, property_name, value)
+    local current = safe_read(object, property_name)
 
-    if type(current) ~= "number" then
-        return false
+    if type(current) ~= "number" or current >= value then
+        return
     end
 
-    if current <= maximum then
-        return true
+    safe_write(object, property_name, value)
+end
+
+local function set_maximum(object, property_name, value)
+    local current = safe_read(object, property_name)
+
+    if type(current) ~= "number" or current <= value then
+        return
     end
 
-    return safe_write(
-        object,
-        property_name,
-        maximum
-    )
+    safe_write(object, property_name, value)
 end
 
 -------------------------------------------------------------------------------
--- OBJECT DISCOVERY
+-- One-time object discovery
 -------------------------------------------------------------------------------
 
-local function collect_instances(class_names)
+local function collect_instances(class_name)
+    local ok, instances = pcall(function()
+        return FindAllOf(class_name)
+    end)
+
+    if not ok or instances == nil then
+        return {}
+    end
+
     local results = {}
-    local seen_addresses = {}
 
-    for _, class_name in ipairs(class_names) do
-        local ok, instances = pcall(function()
-            return FindAllOf(class_name)
-        end)
-
-        if ok and instances ~= nil then
-            for _, instance in pairs(instances) do
-                if is_valid(instance)
-                    and not is_default_object(instance) then
-
-                    local address =
-                        get_address(instance)
-
-                    if address ~= nil
-                        and not seen_addresses[address] then
-
-                        seen_addresses[address] = true
-
-                        table.insert(
-                            results,
-                            instance
-                        )
-                    end
-                end
-            end
+    for _, instance in pairs(instances) do
+        if is_valid(instance) then
+            table.insert(results, instance)
         end
     end
 
@@ -413,13 +280,64 @@ local function collect_instances(class_names)
 end
 
 -------------------------------------------------------------------------------
--- FX AND AUDIO COPYING
+-- Solid feedback donor
 -------------------------------------------------------------------------------
 
-local function copy_feedback(
-    source_behaviour,
-    target_behaviour
-)
+local function remember_solid_donor(component)
+    if not is_valid(component) then
+        return false
+    end
+
+    for _, field_name in ipairs({
+        "PaintedBehaviour",
+        "UnPaintedBehaviour",
+        "Behaviour",
+    }) do
+        local behaviour = safe_read(component, field_name)
+
+        if behaviour ~= nil then
+            local ok, behaviour_type = pcall(function()
+                return behaviour.Type
+            end)
+
+            if ok and behaviour_type == TYPE_SOLID then
+                solid_donor_owner = component
+                solid_donor_field = field_name
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function get_solid_donor()
+    if not is_valid(solid_donor_owner) or solid_donor_field == nil then
+        solid_donor_owner = nil
+        solid_donor_field = nil
+        return nil
+    end
+
+    local behaviour = safe_read(solid_donor_owner, solid_donor_field)
+
+    if behaviour == nil then
+        return nil
+    end
+
+    local ok, behaviour_type = pcall(function()
+        return behaviour.Type
+    end)
+
+    if not ok or behaviour_type ~= TYPE_SOLID then
+        solid_donor_owner = nil
+        solid_donor_field = nil
+        return nil
+    end
+
+    return behaviour
+end
+
+local function copy_feedback(source_behaviour, target_behaviour)
     if not Config.copy_solid_fx_and_audio
         or source_behaviour == nil
         or target_behaviour == nil then
@@ -427,350 +345,297 @@ local function copy_feedback(
         return
     end
 
-    for _, field_name in ipairs(
-        FEEDBACK_FIELDS
-    ) do
+    for _, field_name in ipairs(FEEDBACK_FIELDS) do
         local read_ok, value = pcall(function()
             return source_behaviour[field_name]
         end)
 
         if read_ok then
             pcall(function()
-                target_behaviour[field_name] =
-                    value
+                target_behaviour[field_name] = value
             end)
         end
     end
 end
 
 -------------------------------------------------------------------------------
--- FIND A SOLID FEEDBACK DONOR
+-- Surface processing
 -------------------------------------------------------------------------------
 
-local function find_solid_behaviour(
-    painted_components,
-    standard_components
-)
-    for _, component in ipairs(
-        painted_components
-    ) do
-        local ok, behaviour = pcall(function()
-            if component.PaintedBehaviour.Type
-                == TYPE_SOLID then
-
-                return component.PaintedBehaviour
-            end
-
-            if component.UnPaintedBehaviour.Type
-                == TYPE_SOLID then
-
-                return component.UnPaintedBehaviour
-            end
-
-            return nil
-        end)
-
-        if ok and behaviour ~= nil then
-            return behaviour
-        end
-    end
-
-    for _, component in ipairs(
-        standard_components
-    ) do
-        local ok, behaviour = pcall(function()
-            if component.Behaviour.Type
-                == TYPE_SOLID then
-
-                return component.Behaviour
-            end
-
-            return nil
-        end)
-
-        if ok and behaviour ~= nil then
-            return behaviour
-        end
-    end
-
-    return nil
-end
-
--------------------------------------------------------------------------------
--- PAINTED SURFACE MODE
--------------------------------------------------------------------------------
-
-local function process_painted_component(
-    component,
-    global_solid_donor
-)
+-- Returns complete, changed. A false complete value asks the new-object handler
+-- to retry after Unreal has had more time to initialize the component.
+local function process_painted_component(component)
     local key = object_key(component)
 
-    if key == nil or processed_painted[key] then
-        return
+    if key == nil then
+        return false, false
+    elseif processed_painted[key] then
+        return true, false
     end
 
-    local ok, changed_or_error = pcall(function()
-        local painted =
-            component.PaintedBehaviour
+    local ok, complete, changed = pcall(function()
+        local painted = component.PaintedBehaviour
+        local unpainted = component.UnPaintedBehaviour
 
-        local unpainted =
-            component.UnPaintedBehaviour
-
-        -----------------------------------------------------------------------
-        -- PAINTED MODE
-        -----------------------------------------------------------------------
-
-        if ActiveMode == "painted" then
-            -- This is the tested Vanilla+ repair:
-            --
-            -- Solid painted region + Adamant unpainted region.
-            --
-            -- Only PaintedClimbable components are affected. Dedicated
-            -- Adamant and Weak climbables are not touched.
-
-            if painted.Type ~= TYPE_SOLID then
-                return false
-            end
-
-            if unpainted.Type ~= TYPE_ADAMANT then
-                return false
-            end
-
-            copy_feedback(
-                painted,
-                unpainted
-            )
-
-            unpainted.Type = TYPE_SOLID
-
-            if component.UnPaintedBehaviour.Type
-                ~= TYPE_SOLID then
-
-                error(
-                    "Painted surface repair verification failed"
-                )
-            end
-
-            return true
+        if painted == nil or unpainted == nil then
+            return false, false
         end
 
-        -----------------------------------------------------------------------
-        -- OPEN MODE
-        -----------------------------------------------------------------------
+        local painted_type = painted.Type
+        local unpainted_type = unpainted.Type
+
+        if type(painted_type) ~= "number"
+            or type(unpainted_type) ~= "number" then
+
+            return false, false
+        end
+
+        -- Preserve a genuine Solid behaviour before changing anything.
+        if painted_type == TYPE_SOLID
+            or unpainted_type == TYPE_SOLID then
+
+            remember_solid_donor(component)
+        end
+
+        if ActiveMode == "painted" then
+            -- Tested Vanilla+ repair. Only the usual Solid-painted / Adamant-
+            -- unpainted pairing is changed; unusual or special pairings remain.
+            if painted_type == TYPE_SOLID
+                and unpainted_type == TYPE_ADAMANT then
+
+                copy_feedback(painted, unpainted)
+                unpainted.Type = TYPE_SOLID
+
+                if component.UnPaintedBehaviour.Type ~= TYPE_SOLID then
+                    error("Painted surface repair verification failed")
+                end
+
+                return true, true
+            end
+
+            return true, false
+        end
 
         if ActiveMode == "open" then
-            local donor = global_solid_donor
+            local donor = get_solid_donor()
 
-            if painted.Type == TYPE_SOLID then
+            if painted_type == TYPE_SOLID then
                 donor = painted
-            elseif unpainted.Type == TYPE_SOLID then
+            elseif unpainted_type == TYPE_SOLID then
                 donor = unpainted
             end
 
-            local changed =
-                painted.Type ~= TYPE_SOLID
-                or unpainted.Type ~= TYPE_SOLID
+            local was_changed =
+                painted_type ~= TYPE_SOLID
+                or unpainted_type ~= TYPE_SOLID
 
             if donor ~= nil then
-                if painted.Type ~= TYPE_SOLID then
-                    copy_feedback(
-                        donor,
-                        painted
-                    )
+                if painted_type ~= TYPE_SOLID then
+                    copy_feedback(donor, painted)
                 end
 
-                if unpainted.Type ~= TYPE_SOLID then
-                    copy_feedback(
-                        donor,
-                        unpainted
-                    )
+                if unpainted_type ~= TYPE_SOLID then
+                    copy_feedback(donor, unpainted)
                 end
             end
 
             painted.Type = TYPE_SOLID
             unpainted.Type = TYPE_SOLID
 
-            return changed
+            if component.PaintedBehaviour.Type ~= TYPE_SOLID
+                or component.UnPaintedBehaviour.Type ~= TYPE_SOLID then
+
+                error("Open-mode painted surface verification failed")
+            end
+
+            return true, was_changed
         end
 
-        return false
+        return true, false
     end)
 
     if not ok then
         log(string.format(
             "Could not process painted component %s: %s",
             get_full_name(component),
-            tostring(changed_or_error)
+            tostring(complete)
         ))
 
-        return
+        return false, false
     end
 
-    processed_painted[key] = true
+    if complete then
+        processed_painted[key] = true
 
-    if changed_or_error then
-        log(
-            "Updated painted climbable: "
-            .. get_full_name(component),
-            true
-        )
+        if changed then
+            log(
+                "Updated painted climbable: "
+                .. get_full_name(component)
+            )
+        end
     end
+
+    return complete, changed
 end
 
--------------------------------------------------------------------------------
--- OPEN MODE STANDARD CLIMBABLES
--------------------------------------------------------------------------------
-
-local function process_standard_climbable(
-    component,
-    global_solid_donor
-)
+local function process_standard_climbable(component)
     if ActiveMode ~= "open" then
-        return
+        return true, false
     end
 
     local key = object_key(component)
 
-    if key == nil or processed_standard[key] then
-        return
+    if key == nil then
+        return false, false
+    elseif processed_standard[key] then
+        return true, false
     end
 
-    local ok, changed_or_error = pcall(function()
-        local behaviour =
-            component.Behaviour
+    local ok, complete, changed = pcall(function()
+        local behaviour = component.Behaviour
 
-        local changed =
-            behaviour.Type ~= TYPE_SOLID
+        if behaviour == nil then
+            return false, false
+        end
 
-        if changed
-            and global_solid_donor ~= nil then
+        local behaviour_type = behaviour.Type
 
+        if type(behaviour_type) ~= "number" then
+            return false, false
+        end
+
+        -- Only remember a donor that was genuinely Solid before conversion.
+        if behaviour_type == TYPE_SOLID then
+            remember_solid_donor(component)
+        end
+
+        local was_changed =
+            behaviour_type ~= TYPE_SOLID
+
+        if was_changed then
             copy_feedback(
-                global_solid_donor,
+                get_solid_donor(),
                 behaviour
             )
+
+            behaviour.Type = TYPE_SOLID
         end
 
-        behaviour.Type = TYPE_SOLID
-
-        if component.Behaviour.Type
-            ~= TYPE_SOLID then
-
-            error(
-                "Open-mode surface verification failed"
-            )
+        if component.Behaviour.Type ~= TYPE_SOLID then
+            error("Open-mode standard surface verification failed")
         end
 
-        return changed
+        return true, was_changed
     end)
 
     if not ok then
         log(string.format(
             "Could not process climbable component %s: %s",
             get_full_name(component),
-            tostring(changed_or_error)
+            tostring(complete)
         ))
 
-        return
+        return false, false
     end
 
-    processed_standard[key] = true
+    if complete then
+        processed_standard[key] = true
 
-    if changed_or_error then
-        log(
-            "Converted registered climbable to Solid: "
-            .. get_full_name(component),
-            true
-        )
+        if changed then
+            log(
+                "Converted registered climbable to Solid: "
+                .. get_full_name(component)
+            )
+        end
     end
+
+    return complete, changed
 end
 
 -------------------------------------------------------------------------------
--- MOVEMENT IMPROVEMENTS
+-- Climber processing
 -------------------------------------------------------------------------------
 
 local function tune_climber(climber)
-    if not Config.enable_movement_improvements then
-        return
+    if not Config.enable_movement_improvements
+        and not Config.enable_climbing_jump then
+
+        return true
     end
 
     local key = object_key(climber)
 
-    if key == nil or processed_climbers[key] then
-        return
+    if key == nil then
+        return false
+    elseif processed_climbers[key] then
+        return true
     end
 
-    -- Use the game's public setters when available.
-    pcall(function()
-        climber:SetClimbingAllowed(true)
-    end)
-
-    if Config.start_with_one_button then
+    if Config.enable_movement_improvements then
         pcall(function()
-            climber:SetStartClimbingWithOneButton(
-                true
-            )
+            climber:SetClimbingAllowed(true)
         end)
+
+        if Config.start_with_one_button then
+            pcall(function()
+                climber:SetStartClimbingWithOneButton(true)
+            end)
+        end
+
+        set_boolean(
+            climber,
+            "bClimbingAllowed",
+            true
+        )
+
+        set_boolean(
+            climber,
+            "bStartClimbingWithOneButton",
+            Config.start_with_one_button
+        )
+
+        set_minimum(
+            climber,
+            "ClimbableDetectionDistStanding",
+            Config.standing_detection_distance
+        )
+
+        set_minimum(
+            climber,
+            "ClimbableDetectionDistFalling",
+            Config.falling_detection_distance
+        )
+
+        set_minimum(
+            climber,
+            "CoyoteTime",
+            Config.coyote_time
+        )
+
+        set_minimum(
+            climber,
+            "GrabPickaxeDistance",
+            Config.grab_pickaxe_distance
+        )
+
+        set_minimum(
+            climber,
+            "MaxPickaxeVelocity",
+            Config.max_pickaxe_velocity
+        )
+
+        set_minimum(
+            climber,
+            "PickaxeAcceleration",
+            Config.pickaxe_acceleration
+        )
+
+        set_maximum(
+            climber,
+            "StepDurationMultiplier",
+            Config.maximum_step_duration_multiplier
+        )
     end
-
-    set_boolean(
-        climber,
-        "bClimbingAllowed",
-        true
-    )
-
-    set_boolean(
-        climber,
-        "bStartClimbingWithOneButton",
-        Config.start_with_one_button
-    )
-
-    set_minimum(
-        climber,
-        "ClimbableDetectionDistStanding",
-        Config.standing_detection_distance
-    )
-
-    set_minimum(
-        climber,
-        "ClimbableDetectionDistFalling",
-        Config.falling_detection_distance
-    )
-
-    set_minimum(
-        climber,
-        "CoyoteTime",
-        Config.coyote_time
-    )
-
-    set_minimum(
-        climber,
-        "GrabPickaxeDistance",
-        Config.grab_pickaxe_distance
-    )
-
-    set_minimum(
-        climber,
-        "MaxPickaxeVelocity",
-        Config.max_pickaxe_velocity
-    )
-
-    set_minimum(
-        climber,
-        "PickaxeAcceleration",
-        Config.pickaxe_acceleration
-    )
-
-    set_maximum(
-        climber,
-        "StepDurationMultiplier",
-        Config.maximum_step_duration_multiplier
-    )
-
-    ---------------------------------------------------------------------------
-    -- OPTIONAL CLIMBING JUMP
-    ---------------------------------------------------------------------------
 
     if Config.enable_climbing_jump then
         set_boolean(
@@ -795,88 +660,189 @@ local function tune_climber(climber)
     processed_climbers[key] = true
 
     log(
-        "Applied climbing movement settings to: "
+        "Applied climbing settings to: "
         .. get_full_name(climber)
     )
+
+    return true
 end
 
 -------------------------------------------------------------------------------
--- MAIN SCAN
+-- Event-driven processing
 -------------------------------------------------------------------------------
 
-local function scan_game()
-    if scan_running
+local function schedule_object_processing(object, processor)
+    local first_delay =
+        tonumber(Config.new_object_delay_ms)
+        or 250
+
+    first_delay =
+        math.max(0, first_delay)
+
+    local retry_delay =
+        math.max(250, first_delay)
+
+    local max_attempts = 3
+
+    local function attempt(number)
+        local delay =
+            number == 1
+            and first_delay
+            or retry_delay
+
+        ExecuteWithDelay(delay, function()
+            run_on_game_thread(function()
+                if not is_valid(object) then
+                    return
+                end
+
+                local complete =
+                    processor(object)
+
+                if not complete
+                    and number < max_attempts then
+
+                    attempt(number + 1)
+                end
+            end)
+        end)
+    end
+
+    attempt(1)
+end
+
+local function register_new_object_listener(
+    class_path,
+    processor
+)
+    local ok, error_message = pcall(function()
+        NotifyOnNewObject(
+            class_path,
+
+            function(object)
+                schedule_object_processing(
+                    object,
+                    processor
+                )
+
+                -- Keep listening for future objects.
+                return false
+            end
+        )
+    end)
+
+    if not ok then
+        log(string.format(
+            "Could not register listener for %s: %s",
+            class_path,
+            tostring(error_message)
+        ), true)
+    end
+end
+
+local function process_new_painted(component)
+    remember_solid_donor(component)
+    return process_painted_component(component)
+end
+
+local function process_new_standard(component)
+    remember_solid_donor(component)
+    return process_standard_climbable(component)
+end
+
+-------------------------------------------------------------------------------
+-- One startup pass for objects that predate the listeners
+-------------------------------------------------------------------------------
+
+local function run_startup_scan()
+    if startup_scan_running
         or ActiveMode == "vanilla" then
 
         return
     end
 
-    scan_running = true
+    startup_scan_running = true
 
     local ok, error_message = pcall(function()
         local painted_components =
-            collect_instances({
-                "PaintedClimbable",
-                "BP_PaintedClimbable_Mars_C",
-            })
+            collect_instances(
+                "PaintedClimbable"
+            )
 
-        local standard_components = {}
+        local standard_components =
+            ActiveMode == "open"
+            and collect_instances("Climbable")
+            or {}
 
-        if ActiveMode == "open" then
-            standard_components =
-                collect_instances({
-                    "Climbable",
+        local climbers =
+            collect_instances(
+                "ClimberComponent"
+            )
 
-                    "BP_AdamantClimbable_Mars_C",
-                    "BP_AdamantClimbable_Metal_C",
-
-                    "BP_SolidClimbable_Mars_C",
-                    "BP_SolidClimbable_Cloth_C",
-                })
+        -- Locate a genuine Solid donor before converting anything.
+        for _, component in ipairs(
+            painted_components
+        ) do
+            if remember_solid_donor(component) then
+                break
+            end
         end
 
-        local solid_donor =
-            find_solid_behaviour(
-                painted_components,
+        if get_solid_donor() == nil then
+            for _, component in ipairs(
                 standard_components
-            )
+            ) do
+                if remember_solid_donor(component) then
+                    break
+                end
+            end
+        end
+
+        local painted_changed = 0
+        local standard_changed = 0
 
         for _, component in ipairs(
             painted_components
         ) do
-            process_painted_component(
-                component,
-                solid_donor
-            )
-        end
+            local _, changed =
+                process_painted_component(component)
 
-        if ActiveMode == "open" then
-            for _, component in ipairs(
-                standard_components
-            ) do
-                process_standard_climbable(
-                    component,
-                    solid_donor
-                )
+            if changed then
+                painted_changed =
+                    painted_changed + 1
             end
         end
 
-        local climbers =
-            collect_instances({
-                "ClimberComponent",
-                "BP_Climber_C",
-            })
+        for _, component in ipairs(
+            standard_components
+        ) do
+            local _, changed =
+                process_standard_climbable(component)
+
+            if changed then
+                standard_changed =
+                    standard_changed + 1
+            end
+        end
 
         for _, climber in ipairs(climbers) do
             tune_climber(climber)
         end
+
+        log(string.format(
+            "Startup pass complete: %d painted updated, "
+            .. "%d standard updated, %d climber(s) found.",
+            painted_changed,
+            standard_changed,
+            #climbers
+        ), true)
     end)
 
-    scan_running = false
+    startup_scan_running = false
 
     if not ok then
         log(
-            "Automatic scan failed: "
+            "Startup scan failed: "
             .. tostring(error_message),
             true
         )
@@ -884,36 +850,7 @@ local function scan_game()
 end
 
 -------------------------------------------------------------------------------
--- SCHEDULING
--------------------------------------------------------------------------------
-
-local function scan_on_game_thread()
-    if type(ExecuteInGameThread)
-        == "function" then
-
-        ExecuteInGameThread(scan_game)
-    else
-        scan_game()
-    end
-end
-
-local function schedule_next_scan()
-    local interval =
-        tonumber(Config.scan_interval_ms)
-        or 1500
-
-    if interval < 500 then
-        interval = 500
-    end
-
-    ExecuteWithDelay(interval, function()
-        scan_on_game_thread()
-        schedule_next_scan()
-    end)
-end
-
--------------------------------------------------------------------------------
--- STARTUP
+-- Startup
 -------------------------------------------------------------------------------
 
 print(string.format(
@@ -932,14 +869,43 @@ if ActiveMode == "vanilla" then
     return
 end
 
-ExecuteWithDelay(1000, function()
-    scan_on_game_thread()
+-- NotifyOnNewObject covers Blueprint subclasses of these native base classes.
+register_new_object_listener(
+    "/Script/DeliverUsMars.PaintedClimbable",
+    process_new_painted
+)
+
+if ActiveMode == "open" then
+    register_new_object_listener(
+        "/Script/DeliverUsMars.Climbable",
+        process_new_standard
+    )
+end
+
+if Config.enable_movement_improvements
+    or Config.enable_climbing_jump then
+
+    register_new_object_listener(
+        "/Script/DeliverUsMars.ClimberComponent",
+        tune_climber
+    )
+end
+
+local startup_delay =
+    tonumber(Config.initial_scan_delay_ms)
+    or 1500
+
+startup_delay =
+    math.max(0, startup_delay)
+
+ExecuteWithDelay(startup_delay, function()
+    run_on_game_thread(
+        run_startup_scan
+    )
 end)
 
-schedule_next_scan()
-
 print(string.format(
-    "[%s] Automatic climbing improvements enabled: %s\n",
+    "[%s] Event-driven climbing improvements enabled: %s\n",
     MOD_NAME,
     ActiveMode
 ))
