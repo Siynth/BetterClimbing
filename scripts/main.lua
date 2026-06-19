@@ -15,7 +15,7 @@
 --   * No timer per surface.
 
 local MOD_NAME = "BetterClimbing"
-local VERSION = "0.4.0-beta"
+local VERSION = "0.4.0"
 
 -------------------------------------------------------------------------------
 -- GAME ENUM VALUES
